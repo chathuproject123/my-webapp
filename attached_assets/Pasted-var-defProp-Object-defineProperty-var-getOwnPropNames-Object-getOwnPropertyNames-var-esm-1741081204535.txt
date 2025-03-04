@@ -1,0 +1,550 @@
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
+// server/storage.ts
+import session from "express-session";
+import createMemoryStore from "memorystore";
+var MemoryStore, MemStorage, storage;
+var init_storage = __esm({
+  "server/storage.ts"() {
+    "use strict";
+    MemoryStore = createMemoryStore(session);
+    MemStorage = class {
+      users;
+      transactions;
+      currentUserId;
+      currentTransactionId;
+      sessionStore;
+      constructor() {
+        this.users = /* @__PURE__ */ new Map();
+        this.transactions = /* @__PURE__ */ new Map();
+        this.currentUserId = 1;
+        this.currentTransactionId = 1;
+        this.sessionStore = new MemoryStore({
+          checkPeriod: 864e5
+          // 24 hours
+        });
+      }
+      async getAllUsers() {
+        return Array.from(this.users.values());
+      }
+      async getUser(id) {
+        return this.users.get(id);
+      }
+      async getUserByUsername(username) {
+        return Array.from(this.users.values()).find(
+          (user) => user.username === username
+        );
+      }
+      async getUserByEmail(email) {
+        return Array.from(this.users.values()).find(
+          (user) => user.email === email
+        );
+      }
+      async createUser(insertUser) {
+        const id = this.currentUserId++;
+        const user = {
+          ...insertUser,
+          id,
+          balance: 0,
+          isAdmin: false,
+          isBanned: false,
+          lastLoginIp: null,
+          lastLoginTime: null,
+          createdAt: /* @__PURE__ */ new Date()
+        };
+        this.users.set(id, user);
+        return user;
+      }
+      async updateUserBanStatus(userId, isBanned) {
+        const user = await this.getUser(userId);
+        if (!user) throw new Error("User not found");
+        user.isBanned = isBanned;
+        this.users.set(userId, user);
+      }
+      async updateLastLogin(userId, ip) {
+        const user = await this.getUser(userId);
+        if (!user) throw new Error("User not found");
+        user.lastLoginIp = ip;
+        user.lastLoginTime = /* @__PURE__ */ new Date();
+        this.users.set(userId, user);
+      }
+      async detectMultipleAccounts(ip) {
+        return Array.from(this.users.values()).filter(
+          (user) => user.lastLoginIp === ip
+        );
+      }
+      async getTransactions(userId) {
+        return Array.from(this.transactions.values()).filter((t) => t.userId === userId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      }
+      async createTransaction(userId, data) {
+        const id = this.currentTransactionId++;
+        const transaction = {
+          ...data,
+          id,
+          userId,
+          createdAt: /* @__PURE__ */ new Date()
+        };
+        this.transactions.set(id, transaction);
+        return transaction;
+      }
+      async updateBalance(userId, amount) {
+        const user = await this.getUser(userId);
+        if (!user) throw new Error("User not found");
+        user.balance += amount;
+        this.users.set(userId, user);
+      }
+      async createAdminUser(insertUser) {
+        const id = this.currentUserId++;
+        const user = {
+          ...insertUser,
+          id,
+          balance: 0,
+          isAdmin: true,
+          isBanned: false,
+          lastLoginIp: null,
+          lastLoginTime: null,
+          createdAt: /* @__PURE__ */ new Date()
+        };
+        this.users.set(id, user);
+        return user;
+      }
+    };
+    storage = new MemStorage();
+  }
+});
+
+// server/auth.ts
+var auth_exports = {};
+__export(auth_exports, {
+  hashPassword: () => hashPassword,
+  setupAuth: () => setupAuth
+});
+import passport from "passport";
+import { Strategy as LocalStrategy } from "passport-local";
+import session2 from "express-session";
+import { scrypt, randomBytes, timingSafeEqual } from "crypto";
+import { promisify } from "util";
+async function hashPassword(password) {
+  const salt = randomBytes(16).toString("hex");
+  const buf = await scryptAsync(password, salt, 64);
+  return `${buf.toString("hex")}.${salt}`;
+}
+async function comparePasswords(supplied, stored) {
+  const [hashed, salt] = stored.split(".");
+  const hashedBuf = Buffer.from(hashed, "hex");
+  const suppliedBuf = await scryptAsync(supplied, salt, 64);
+  return timingSafeEqual(hashedBuf, suppliedBuf);
+}
+function setupAuth(app2) {
+  const sessionSettings = {
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    store: storage.sessionStore,
+    cookie: {
+      secure: process.env.NODE_ENV === "production",
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1e3
+      // 24 hours
+    }
+  };
+  app2.set("trust proxy", 1);
+  app2.use(session2(sessionSettings));
+  app2.use(passport.initialize());
+  app2.use(passport.session());
+  passport.use(
+    new LocalStrategy(async (username, password, done) => {
+      try {
+        const user = await storage.getUserByUsername(username);
+        if (!user) {
+          return done(null, false, { message: "Invalid username or password" });
+        }
+        if (user.isBanned) {
+          return done(null, false, { message: "This account has been banned" });
+        }
+        const isValid = await comparePasswords(password, user.password);
+        if (!isValid) {
+          return done(null, false, { message: "Invalid username or password" });
+        }
+        return done(null, user);
+      } catch (err) {
+        return done(err);
+      }
+    })
+  );
+  passport.serializeUser((user, done) => done(null, user.id));
+  passport.deserializeUser(async (id, done) => {
+    try {
+      const user = await storage.getUser(id);
+      if (!user) {
+        return done(null, false);
+      }
+      done(null, user);
+    } catch (err) {
+      done(err);
+    }
+  });
+  app2.post("/api/register", async (req, res, next) => {
+    try {
+      const existingUser = await storage.getUserByUsername(req.body.username);
+      if (existingUser) {
+        return res.status(400).json({ message: "Username already exists" });
+      }
+      const existingEmail = await storage.getUserByEmail(req.body.email);
+      if (existingEmail) {
+        return res.status(400).json({ message: "Email already registered" });
+      }
+      const ip = req.ip;
+      const accountsFromIp = await storage.detectMultipleAccounts(ip);
+      if (accountsFromIp.length >= 3) {
+        return res.status(400).json({ message: "Too many accounts from this IP address" });
+      }
+      const user = await storage.createUser({
+        ...req.body,
+        password: await hashPassword(req.body.password)
+      });
+      await storage.updateLastLogin(user.id, ip);
+      req.login(user, (err) => {
+        if (err) return next(err);
+        res.status(201).json(user);
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+  app2.post("/api/login", (req, res, next) => {
+    passport.authenticate("local", async (err, user, info) => {
+      if (err) return next(err);
+      if (!user) {
+        return res.status(401).json({ message: info?.message || "Authentication failed" });
+      }
+      await storage.updateLastLogin(user.id, req.ip);
+      req.login(user, (err2) => {
+        if (err2) return next(err2);
+        res.status(200).json(user);
+      });
+    })(req, res, next);
+  });
+  app2.post("/api/logout", (req, res, next) => {
+    req.logout((err) => {
+      if (err) return next(err);
+      res.sendStatus(200);
+    });
+  });
+  app2.get("/api/user", (req, res) => {
+    if (!req.isAuthenticated()) return res.sendStatus(401);
+    res.json(req.user);
+  });
+}
+var scryptAsync;
+var init_auth = __esm({
+  "server/auth.ts"() {
+    "use strict";
+    init_storage();
+    scryptAsync = promisify(scrypt);
+  }
+});
+
+// server/index.ts
+import express2 from "express";
+
+// server/routes.ts
+init_auth();
+init_storage();
+import { createServer } from "http";
+
+// shared/schema.ts
+import { pgTable, text, serial, integer, timestamp, boolean, jsonb } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+var users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  email: text("email").notNull().unique(),
+  password: text("password").notNull(),
+  balance: integer("balance").notNull().default(0),
+  isAdmin: boolean("is_admin").notNull().default(false),
+  isBanned: boolean("is_banned").notNull().default(false),
+  lastLoginIp: text("last_login_ip"),
+  lastLoginTime: timestamp("last_login_time"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  experiencePoints: integer("experience_points").notNull().default(0),
+  level: integer("level").notNull().default(1)
+});
+var transactions = pgTable("transactions", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull(),
+  amount: integer("amount").notNull(),
+  type: text("type").notNull(),
+  description: text("description").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow()
+});
+var challenges = pgTable("challenges", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  type: text("type").notNull(),
+  difficulty: text("difficulty").notNull(),
+  points: integer("points").notNull(),
+  content: jsonb("content").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow()
+});
+var userProgress = pgTable("user_progress", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull(),
+  challengeId: integer("challenge_id").notNull(),
+  completed: boolean("completed").notNull().default(false),
+  score: integer("score"),
+  completedAt: timestamp("completed_at"),
+  attempts: integer("attempts").notNull().default(0)
+});
+var insertChallengeSchema = createInsertSchema(challenges).extend({
+  content: z.object({
+    questions: z.array(z.object({
+      question: z.string(),
+      options: z.array(z.string()),
+      correctAnswer: z.number(),
+      explanation: z.string()
+    })).optional(),
+    tasks: z.array(z.object({
+      description: z.string(),
+      requirement: z.string(),
+      verificationMethod: z.string()
+    })).optional()
+  })
+});
+var insertUserSchema = createInsertSchema(users).pick({
+  username: true,
+  email: true,
+  password: true
+}).extend({
+  email: z.string().email("Invalid email format")
+});
+var insertTransactionSchema = createInsertSchema(transactions).pick({
+  amount: true,
+  type: true,
+  description: true
+});
+
+// server/routes.ts
+import { ZodError } from "zod";
+function isAdmin(req, res, next) {
+  if (!req.isAuthenticated()) return res.sendStatus(401);
+  if (!req.user.isAdmin) return res.sendStatus(403);
+  next();
+}
+async function registerRoutes(app2) {
+  const { hashPassword: hashPassword2 } = await Promise.resolve().then(() => (init_auth(), auth_exports));
+  setupAuth(app2);
+  const adminUser = await storage.getUserByUsername("admin");
+  if (!adminUser) {
+    await storage.createAdminUser({
+      username: "admin",
+      email: "admin@wallet.com",
+      password: await hashPassword2("admin123")
+      // Hash the password before storing
+    });
+  }
+  app2.get("/api/admin/users", isAdmin, async (req, res) => {
+    const users2 = await storage.getAllUsers();
+    res.json(users2);
+  });
+  app2.post("/api/admin/users/:id/ban", isAdmin, async (req, res) => {
+    const userId = parseInt(req.params.id);
+    const { isBanned } = req.body;
+    await storage.updateUserBanStatus(userId, isBanned);
+    res.json({ success: true });
+  });
+  app2.get("/api/transactions", async (req, res) => {
+    if (!req.isAuthenticated()) return res.sendStatus(401);
+    if (req.user.isBanned) return res.status(403).json({ message: "Account is banned" });
+    const transactions2 = await storage.getTransactions(req.user.id);
+    res.json(transactions2);
+  });
+  app2.post("/api/transactions", async (req, res) => {
+    if (!req.isAuthenticated()) return res.sendStatus(401);
+    if (req.user.isBanned) return res.status(403).json({ message: "Account is banned" });
+    try {
+      const data = insertTransactionSchema.parse(req.body);
+      const transaction = await storage.createTransaction(req.user.id, data);
+      await storage.updateBalance(req.user.id, data.amount);
+      res.json(transaction);
+    } catch (err) {
+      if (err instanceof ZodError) {
+        res.status(400).json(err.errors);
+      } else {
+        throw err;
+      }
+    }
+  });
+  const httpServer = createServer(app2);
+  return httpServer;
+}
+
+// server/vite.ts
+import express from "express";
+import fs from "fs";
+import path2, { dirname as dirname2 } from "path";
+import { fileURLToPath as fileURLToPath2 } from "url";
+import { createServer as createViteServer, createLogger } from "vite";
+
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import themePlugin from "@replit/vite-plugin-shadcn-theme-json";
+import path, { dirname } from "path";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+import { fileURLToPath } from "url";
+var __filename = fileURLToPath(import.meta.url);
+var __dirname = dirname(__filename);
+var vite_config_default = defineConfig({
+  plugins: [
+    react(),
+    runtimeErrorOverlay(),
+    themePlugin(),
+    ...process.env.NODE_ENV !== "production" && process.env.REPL_ID !== void 0 ? [
+      await import("@replit/vite-plugin-cartographer").then(
+        (m) => m.cartographer()
+      )
+    ] : []
+  ],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "client", "src"),
+      "@shared": path.resolve(__dirname, "shared")
+    }
+  },
+  root: path.resolve(__dirname, "client"),
+  build: {
+    outDir: path.resolve(__dirname, "dist/public"),
+    emptyOutDir: true
+  }
+});
+
+// server/vite.ts
+import { nanoid } from "nanoid";
+var __filename2 = fileURLToPath2(import.meta.url);
+var __dirname2 = dirname2(__filename2);
+var viteLogger = createLogger();
+function log(message, source = "express") {
+  const formattedTime = (/* @__PURE__ */ new Date()).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  });
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+async function setupVite(app2, server) {
+  const serverOptions = {
+    middlewareMode: true,
+    hmr: { server },
+    allowedHosts: true
+  };
+  const vite = await createViteServer({
+    ...vite_config_default,
+    configFile: false,
+    customLogger: {
+      ...viteLogger,
+      error: (msg, options) => {
+        viteLogger.error(msg, options);
+        process.exit(1);
+      }
+    },
+    server: serverOptions,
+    appType: "custom"
+  });
+  app2.use(vite.middlewares);
+  app2.use("*", async (req, res, next) => {
+    const url = req.originalUrl;
+    try {
+      const clientTemplate = path2.resolve(
+        __dirname2,
+        "..",
+        "client",
+        "index.html"
+      );
+      let template = await fs.promises.readFile(clientTemplate, "utf-8");
+      template = template.replace(
+        `src="/src/main.tsx"`,
+        `src="/src/main.tsx?v=${nanoid()}"`
+      );
+      const page = await vite.transformIndexHtml(url, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+    } catch (e) {
+      vite.ssrFixStacktrace(e);
+      next(e);
+    }
+  });
+}
+function serveStatic(app2) {
+  const distPath = path2.resolve(__dirname2, "public");
+  if (!fs.existsSync(distPath)) {
+    throw new Error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
+  }
+  app2.use(express.static(distPath));
+  app2.use("*", (_req, res) => {
+    res.sendFile(path2.resolve(distPath, "index.html"));
+  });
+}
+
+// server/index.ts
+var app = express2();
+app.use(express2.json());
+app.use(express2.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path3 = req.path;
+  let capturedJsonResponse = void 0;
+  const originalResJson = res.json;
+  res.json = function(bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path3.startsWith("/api")) {
+      let logLine = `${req.method} ${path3} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+      if (logLine.length > 80) {
+        logLine = logLine.slice(0, 79) + "\u2026";
+      }
+      log(logLine);
+    }
+  });
+  next();
+});
+(async () => {
+  const server = await registerRoutes(app);
+  app.use((err, _req, res, _next) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+    res.status(status).json({ message });
+    throw err;
+  });
+  if (app.get("env") === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+  const port = 5e3;
+  server.listen({
+    port,
+    host: "0.0.0.0",
+    reusePort: true
+  }, () => {
+    log(`serving on port ${port}`);
+  });
+})();

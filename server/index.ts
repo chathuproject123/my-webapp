@@ -1,6 +1,10 @@
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
+import dotenv from "dotenv";
+
+// Load environment variables from .env
+dotenv.config();
 
 const app = express();
 app.use(express.json());
@@ -56,14 +60,28 @@ app.use((req, res, next) => {
     serveStatic(app);
   }
 
-  // ALWAYS serve the app on port 5000
-  // this serves both the API and the client
-  const port = 5000;
-  server.listen({
-    port,
-    host: "0.0.0.0",
-    reusePort: true,
-  }, () => {
-    log(`serving on port ${port}`);
-  });
+  // Add session middleware here if needed.  Example:
+  // const session = require('express-session');
+  // app.use(session({ secret: process.env.SESSION_SECRET || 'development_secret', resave: false, saveUninitialized: false }));
+
+
+  // Try to serve on port 5000 first, fallback to other ports if needed
+  const tryListen = (port: number) => {
+    server.listen({
+      port,
+      host: "0.0.0.0",
+      reusePort: true,
+    }, () => {
+      log(`serving on port ${port}`);
+    }).on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE' && port < 5010) {
+        log(`Port ${port} is in use, trying ${port + 1}`);
+        tryListen(port + 1);
+      } else {
+        throw err;
+      }
+    });
+  };
+  
+  tryListen(5000);
 })();
